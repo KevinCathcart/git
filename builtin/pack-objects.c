@@ -35,6 +35,7 @@
 #define IN_PACK(obj) oe_in_pack(&to_pack, obj)
 #define SIZE(obj) oe_size(&to_pack, obj)
 #define SET_SIZE(obj,size) oe_set_size(&to_pack, obj, size)
+#define TIMESTAMP(obj) oe_timestamp(&to_pack, obj)
 #define DELTA_SIZE(obj) oe_delta_size(&to_pack, obj)
 #define DELTA(obj) oe_delta(&to_pack, obj)
 #define DELTA_CHILD(obj) oe_delta_child(&to_pack, obj)
@@ -58,16 +59,19 @@ static const char *pack_usage[] = {
 static struct packing_data to_pack;
 
 static struct pack_idx_entry **written_list;
+static timestamp_t **timestamp_list;
 static uint32_t nr_result, nr_written, nr_seen;
 
 static int non_empty;
 static int reuse_delta = 1, reuse_object = 1;
 static int keep_unreachable, unpack_unreachable, include_tag;
+static timestamp_t pack_unreachable_expiration; //probably should combine with the next, as they are mutually exclusive
 static timestamp_t unpack_unreachable_expiration;
 static int pack_loose_unreachable;
 static int local;
 static int have_non_local_packs;
 static int incremental;
+static int only_unreachable;
 static int ignore_packed_keep_on_disk;
 static int ignore_packed_keep_in_core;
 static int allow_ofs_delta;
@@ -583,6 +587,8 @@ static enum write_one_status write_one(struct hashfile *f,
 		e->idx.offset = recursing;
 		return WRITE_ONE_BREAK;
 	}
+	if(timestamp_list)
+		timestamp_list[nr_written] = TIMESTAMP(e);
 	written_list[nr_written++] = &e->idx;
 
 	/* make sure off_t is sufficiently large not to wrap */
@@ -828,6 +834,7 @@ static void write_pack_file(void)
 	if (progress > pack_to_stdout)
 		progress_state = start_progress(_("Writing objects"), nr_result);
 	ALLOC_ARRAY(written_list, to_pack.nr_objects);
+	//TODO: Alloc timestamp_list if we are writing timestamps
 	write_order = compute_write_order();
 
 	do {
@@ -898,7 +905,9 @@ static void write_pack_file(void)
 				if (utime(pack_tmp_name, &utb) < 0)
 					warning_errno(_("failed utime() on %s"), pack_tmp_name);
 			}
-
+            // Write timestamp file here. (will update finish_tmp_packfile to rename it when it renames the pack ind idx files).
+			// loop through written list. Get hash from []->oid.hash. Use hash to look up in to_pack. 
+			// if we know e, the timestamp will be at :to_pack->timestamps[e - to_pack->objects];
 			strbuf_addf(&tmpname, "%s-", base_name);
 
 			if (write_bitmap_index) {
@@ -938,6 +947,7 @@ static void write_pack_file(void)
 	} while (nr_remaining && i < to_pack.nr_objects);
 
 	free(written_list);
+	free(timestamp_list); //I'm assuming the converntion is that freeing null is ok. 
 	free(write_order);
 	stop_progress(&progress_state);
 	if (written != nr_result)
@@ -991,7 +1001,7 @@ static int want_found_object(int exclude, struct packed_git *p)
 {
 	if (exclude)
 		return 1;
-	if (incremental)
+	if (incremental && !is_unreachable_pack(p))
 		return 0;
 
 	/*
@@ -1144,6 +1154,7 @@ static int add_object_entry_from_bitmap(const struct object_id *oid,
 					int flags, uint32_t name_hash,
 					struct packed_git *pack, off_t offset)
 {
+	//TODO: only_unreachable?
 	uint32_t index_pos;
 
 	display_progress(progress_state, ++nr_seen);
@@ -2502,6 +2513,7 @@ static void add_tag_chain(const struct object_id *oid)
 			die(_("unable to pack objects reachable from tag %s"),
 			    oid_to_hex(oid));
 
+		//TODO: for only_unreachable, skip adding object, but mark as added? 
 		add_object_entry(&tag->object.oid, OBJ_TAG, NULL, 0);
 
 		if (tag->tagged->type != OBJ_TAG)
@@ -2686,6 +2698,10 @@ static void read_object_list_from_stdin(void)
 
 static void show_commit(struct commit *commit, void *data)
 {
+	if(only_unreachable) {
+		commit->object.flags |= OBJECT_ADDED; //Lie and mark the reachable object as added
+		return;
+	}
 	add_object_entry(&commit->object.oid, OBJ_COMMIT, NULL, 0);
 	commit->object.flags |= OBJECT_ADDED;
 
@@ -2695,6 +2711,10 @@ static void show_commit(struct commit *commit, void *data)
 
 static void show_object(struct object *obj, const char *name, void *data)
 {
+	if(only_unreachable) {
+		commit->object.flags |= OBJECT_ADDED; //Lie and mark the reachable object as added
+		return;
+	}
 	add_preferred_base_object(name);
 	add_object_entry(&obj->oid, obj->type, name, 0);
 	obj->flags |= OBJECT_ADDED;
@@ -2760,6 +2780,7 @@ static int option_parse_missing_action(const struct option *opt,
 
 static void show_edge(struct commit *commit)
 {
+	if(only_unreachable) return; // uncertain if this is right, but i think it is
 	add_preferred_base(&commit->object.oid);
 }
 
@@ -2822,8 +2843,12 @@ static void add_objects_in_unpacked_packs(struct rev_info *revs)
 		for (i = 0; i < p->num_objects; i++) {
 			nth_packed_object_oid(&oid, p, i);
 			o = lookup_unknown_object(oid.hash);
-			if (!(o->flags & OBJECT_ADDED))
+			if (!(o->flags & OBJECT_ADDED)) {
+				// TODO: pack_unreachable_expiration check here
 				mark_in_pack_object(o, p, &in_pack);
+				o->flags |= OBJECT_ADDED;
+			}
+			// TODO: skip the following if pack_unreachable_expiration is set, since a different copy might have a newer date
 			o->flags |= OBJECT_ADDED;
 		}
 	}
@@ -2838,9 +2863,16 @@ static void add_objects_in_unpacked_packs(struct rev_info *revs)
 	free(in_pack.array);
 }
 
-static int add_loose_object(const struct object_id *oid, const char *path,
+static int add_loose_unreachable_object(const struct object_id *oid, const char *path,
 			    void *data)
 {
+	struct object *o = lookup_unknown_object(oid->hash);
+	if(o->flags & OBJECT_ADDED)
+		return;
+
+	//TODO: add check against pack_unreachable_expiration here
+	
+		
 	enum object_type type = oid_object_info(the_repository, oid, NULL);
 
 	if (type < 0) {
@@ -2852,15 +2884,10 @@ static int add_loose_object(const struct object_id *oid, const char *path,
 	return 0;
 }
 
-/*
- * We actually don't even have to worry about reachability here.
- * add_object_entry will weed out duplicates, so we just add every
- * loose object we find.
- */
 static void add_unreachable_loose_objects(void)
 {
 	for_each_loose_file_in_objdir(get_object_directory(),
-				      add_loose_object,
+				      add_loose_unreachable_object,
 				      NULL, NULL, NULL);
 }
 
@@ -3175,10 +3202,13 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 			 N_("output pack to stdout")),
 		OPT_BOOL(0, "include-tag", &include_tag,
 			 N_("include tag objects that refer to objects to be packed")),
+		OPT_BOOL(0, "only-unreachable", &only_unreachable,
+			 N_("only include unreachable objects")), // TODO: need a cuttoff time option similar to unpack-unreachable. use as --incremental --only-unreachable --pack-loose-unreachable, or as --only-unreachable --pack-loose-unreachable --keep-unreacable --cuttoff
 		OPT_BOOL(0, "keep-unreachable", &keep_unreachable,
 			 N_("keep unreachable objects")),
 		OPT_BOOL(0, "pack-loose-unreachable", &pack_loose_unreachable,
 			 N_("pack loose unreachable objects")),
+		//Todo: Add Parameter for expiration date of pack_unreachable_expiration
 		{ OPTION_CALLBACK, 0, "unpack-unreachable", NULL, N_("time"),
 		  N_("unpack unreachable objects newer than <time>"),
 		  PARSE_OPT_OPTARG, option_parse_unpack_unreachable },
@@ -3268,6 +3298,7 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 		fetch_if_missing = 0;
 		argv_array_push(&rp, "--exclude-promisor-objects");
 	}
+    //TODO: only_unreachable requires either keep_unreachable or pack_loose_unreachable
 	if (unpack_unreachable || keep_unreachable || pack_loose_unreachable)
 		use_internal_rev_list = 1;
 
@@ -3371,6 +3402,8 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 	if (include_tag && nr_result)
 		for_each_ref(add_ref_tag, NULL);
 	stop_progress(&progress_state);
+	
+	// Add an extra pass over all objects to get latest timestamp (if needed).
 
 	if (non_empty && !nr_result)
 		return 0;
