@@ -32,6 +32,27 @@
 #include "object-store.h"
 #include "dir.h"
 
+/* NOTES:
+  * 2. Timestamps collecting uses a second pass because we need to be sure to use the latest timestamp of the file from any pack, and 
+ *    the algorithms used do not guarentee that we visit every duplicate copy of an object among various packs.
+ * 3. timestamps was added as a seperate array to packing_data (instead of a new field in object_entry) to avoid bloating the memory needed for the common git-pack cases.
+ *
+ * 
+ *
+ * XX. The race condition where an object is inflated from a cruft pack while creating new cruft packs is not an issue. The inflated object will have a
+ *      newer timestamp and will not get purged by `git prine-packed`.
+ * YY. There is an existing race condition where if something freshens a an unreachable object in the pack after git-gc has exploded it out, but before
+ *     the pack is erased, that freshening will be lost. This new method will also loose the freshening in this case.
+ *
+ *  use as --incremental --only-unreachable --pack-loose-unreachable, or as --only-unreachable --pack-loose-unreachable --keep-unreacable --cuttoff=<something>
+ *
+ * locations that need to be modified to use times file if present:
+ * builtin/pack-objects.c loosen_unused_packed_objects
+ * recent.c: add_recent_packed
+ * And obviously we need to tweak `freshen_packed_object`.
+ */
+       
+
 #define IN_PACK(obj) oe_in_pack(&to_pack, obj)
 #define SIZE(obj) oe_size(&to_pack, obj)
 #define SET_SIZE(obj,size) oe_set_size(&to_pack, obj, size)
@@ -1154,7 +1175,6 @@ static int add_object_entry_from_bitmap(const struct object_id *oid,
 					int flags, uint32_t name_hash,
 					struct packed_git *pack, off_t offset)
 {
-	//TODO: only_unreachable?
 	uint32_t index_pos;
 
 	display_progress(progress_state, ++nr_seen);
@@ -2513,7 +2533,6 @@ static void add_tag_chain(const struct object_id *oid)
 			die(_("unable to pack objects reachable from tag %s"),
 			    oid_to_hex(oid));
 
-		//TODO: for only_unreachable, skip adding object, but mark as added? 
 		add_object_entry(&tag->object.oid, OBJ_TAG, NULL, 0);
 
 		if (tag->tagged->type != OBJ_TAG)
@@ -2699,7 +2718,8 @@ static void read_object_list_from_stdin(void)
 static void show_commit(struct commit *commit, void *data)
 {
 	if(only_unreachable) {
-		commit->object.flags |= OBJECT_ADDED; //Lie and mark the reachable object as added
+		//Lie about adding object, so later code can find the unreachable objects
+		commit->object.flags |= OBJECT_ADDED; 
 		return;
 	}
 	add_object_entry(&commit->object.oid, OBJ_COMMIT, NULL, 0);
@@ -2712,7 +2732,8 @@ static void show_commit(struct commit *commit, void *data)
 static void show_object(struct object *obj, const char *name, void *data)
 {
 	if(only_unreachable) {
-		commit->object.flags |= OBJECT_ADDED; //Lie and mark the reachable object as added
+		//Lie about adding object, so later code can find the unreachable objects
+		commit->object.flags |= OBJECT_ADDED; 
 		return;
 	}
 	add_preferred_base_object(name);
@@ -2780,7 +2801,6 @@ static int option_parse_missing_action(const struct option *opt,
 
 static void show_edge(struct commit *commit)
 {
-	if(only_unreachable) return; // uncertain if this is right, but i think it is
 	add_preferred_base(&commit->object.oid);
 }
 
@@ -2848,8 +2868,6 @@ static void add_objects_in_unpacked_packs(struct rev_info *revs)
 				mark_in_pack_object(o, p, &in_pack);
 				o->flags |= OBJECT_ADDED;
 			}
-			// TODO: skip the following if pack_unreachable_expiration is set, since a different copy might have a newer date
-			o->flags |= OBJECT_ADDED;
 		}
 	}
 
@@ -2871,8 +2889,7 @@ static int add_loose_unreachable_object(const struct object_id *oid, const char 
 		return;
 
 	//TODO: add check against pack_unreachable_expiration here
-	
-		
+
 	enum object_type type = oid_object_info(the_repository, oid, NULL);
 
 	if (type < 0) {
@@ -3203,12 +3220,11 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 		OPT_BOOL(0, "include-tag", &include_tag,
 			 N_("include tag objects that refer to objects to be packed")),
 		OPT_BOOL(0, "only-unreachable", &only_unreachable,
-			 N_("only include unreachable objects")), // TODO: need a cuttoff time option similar to unpack-unreachable. use as --incremental --only-unreachable --pack-loose-unreachable, or as --only-unreachable --pack-loose-unreachable --keep-unreacable --cuttoff
+			 N_("only include unreachable objects")), // TODO: need a cuttoff time option similar to unpack-unreachable.
 		OPT_BOOL(0, "keep-unreachable", &keep_unreachable,
 			 N_("keep unreachable objects")),
 		OPT_BOOL(0, "pack-loose-unreachable", &pack_loose_unreachable,
 			 N_("pack loose unreachable objects")),
-		//Todo: Add Parameter for expiration date of pack_unreachable_expiration
 		{ OPTION_CALLBACK, 0, "unpack-unreachable", NULL, N_("time"),
 		  N_("unpack unreachable objects newer than <time>"),
 		  PARSE_OPT_OPTARG, option_parse_unpack_unreachable },
@@ -3332,6 +3348,9 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 		die(_("--keep-unreachable and --unpack-unreachable are incompatible"));
 	if (!rev_list_all || !rev_list_reflog || !rev_list_index)
 		unpack_unreachable_expiration = 0;
+	if(only_unreachable && !(keep_unreachable || pack_loose_unreachable))
+		die(_("--only-unreachable requires --keep-unreachable or --pack-loose-unreachable"));
+	
 
 	if (filter_options.choice) {
 		if (!pack_to_stdout)
@@ -3358,7 +3377,7 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 	if (!use_internal_rev_list || (!pack_to_stdout && write_bitmap_index) || is_repository_shallow(the_repository))
 		use_bitmap_index = 0;
 
-	if (pack_to_stdout || !rev_list_all)
+	if (pack_to_stdout || !rev_list_all || only_unreachable)
 		write_bitmap_index = 0;
 
 	if (progress && all_progress_implied)
